@@ -37,9 +37,11 @@ int ds4_gpu_synchronize(void);
 int ds4_gpu_set_model_map(const void *model_map, uint64_t model_size);
 int ds4_gpu_set_model_fd(int fd);
 int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model_size, uint64_t map_offset, uint64_t map_size);
+int ds4_gpu_register_external_model_fd(const void *model_map, uint64_t model_size, int fd);
 int ds4_gpu_cache_model_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, const char *label);
 int ds4_gpu_cache_q8_f16_range(const void *model_map, uint64_t model_size, uint64_t offset, uint64_t bytes, uint64_t in_dim, uint64_t out_dim, const char *label);
 void ds4_gpu_set_quality(bool quality);
+void ds4_gpu_set_mxfp4_slot_bank(uint32_t slots);
 void ds4_gpu_print_memory_report(const char *label);
 
 /* =========================================================================
@@ -151,6 +153,26 @@ int ds4_gpu_shared_gate_up_swiglu_q8_0_tensor(
         const ds4_gpu_tensor *x);
 
 int ds4_gpu_matmul_f16_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+int ds4_gpu_matmul_bf16_tensor(
+        ds4_gpu_tensor       *out,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                weight_offset,
+        uint64_t                in_dim,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *x,
+        uint64_t                n_tok);
+
+int ds4_gpu_matmul_f8_e4m3_b128_tensor(
         ds4_gpu_tensor       *out,
         const void             *model_map,
         uint64_t                model_size,
@@ -525,6 +547,22 @@ int ds4_gpu_attention_prefill_masked_mixed_heads_tensor(
         uint32_t                head_dim);
 
 int ds4_gpu_attention_output_q8_batch_tensor(
+        ds4_gpu_tensor       *out,
+        ds4_gpu_tensor       *low,
+        ds4_gpu_tensor       *group_tmp,
+        ds4_gpu_tensor       *low_tmp,
+        const void             *model_map,
+        uint64_t                model_size,
+        uint64_t                out_a_offset,
+        uint64_t                out_b_offset,
+        uint64_t                group_dim,
+        uint64_t                rank,
+        uint32_t                n_groups,
+        uint64_t                out_dim,
+        const ds4_gpu_tensor *heads,
+        uint32_t                n_tokens);
+
+int ds4_gpu_attention_output_f8_e4m3_b128_batch_tensor(
         ds4_gpu_tensor       *out,
         ds4_gpu_tensor       *low,
         ds4_gpu_tensor       *group_tmp,

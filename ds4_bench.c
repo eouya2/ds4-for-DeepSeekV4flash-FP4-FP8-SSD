@@ -18,10 +18,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <time.h>
 
 typedef struct {
     const char *model_path;
+    const char *moe_sidecar_path;
     const char *prompt_path;
     const char *chat_prompt_path;
     const char *system;
@@ -33,6 +35,7 @@ typedef struct {
     int ctx_alloc;
     int step_incr;
     int gen_tokens;
+    int moe_slot_bank;
     double step_mul;
     bool warm_weights;
     bool quality;
@@ -63,6 +66,9 @@ static void usage(FILE *fp) {
         "\n"
         "Model and backend:\n"
         "  -m, --model FILE       GGUF model path. Default: ds4flash.gguf\n"
+        "      SSD package directories are resolved as dense/model-dense.gguf + sidecar/.\n"
+        "  --moe-sidecar PATH     SSD Flash-MoE sidecar directory or manifest.\n"
+        "  --moe-slot-bank N      SSD resident expert slots per layer. Default: 16\n"
         "  --metal | --cuda | --cpu | --backend NAME\n"
         "      Select backend explicitly. Defaults to Metal on macOS, CUDA elsewhere.\n"
         "  -t, --threads N        CPU helper threads.\n"
@@ -129,6 +135,34 @@ static ds4_backend default_backend(void) {
 #endif
 }
 
+static bool path_is_dir(const char *path) {
+    struct stat st;
+    return path && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void resolve_ssd_package(
+        bench_config *cfg,
+        char         *model_buf,
+        size_t        model_buf_len,
+        char         *sidecar_buf,
+        size_t        sidecar_buf_len) {
+    if (!path_is_dir(cfg->model_path)) return;
+    int n = snprintf(model_buf, model_buf_len, "%s/dense/model-dense.gguf", cfg->model_path);
+    if (n < 0 || (size_t)n >= model_buf_len) {
+        fprintf(stderr, "ds4-bench: SSD package model path is too long\n");
+        exit(2);
+    }
+    if (!cfg->moe_sidecar_path || !cfg->moe_sidecar_path[0]) {
+        n = snprintf(sidecar_buf, sidecar_buf_len, "%s/sidecar", cfg->model_path);
+        if (n < 0 || (size_t)n >= sidecar_buf_len) {
+            fprintf(stderr, "ds4-bench: SSD package sidecar path is too long\n");
+            exit(2);
+        }
+        cfg->moe_sidecar_path = sidecar_buf;
+    }
+    cfg->model_path = model_buf;
+}
+
 static char *read_file(const char *path) {
     FILE *fp = fopen(path, "rb");
     if (!fp) {
@@ -177,6 +211,7 @@ static bench_config parse_options(int argc, char **argv) {
         .ctx_max = 32768,
         .step_incr = 2048,
         .gen_tokens = 128,
+        .moe_slot_bank = 16,
         .step_mul = 1.0,
     };
 
@@ -187,6 +222,14 @@ static bench_config parse_options(int argc, char **argv) {
             exit(0);
         } else if (!strcmp(arg, "-m") || !strcmp(arg, "--model")) {
             c.model_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--moe-sidecar")) {
+            c.moe_sidecar_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--moe-slot-bank")) {
+            c.moe_slot_bank = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (c.moe_slot_bank < 1 || c.moe_slot_bank > 256) {
+                fprintf(stderr, "ds4-bench: --moe-slot-bank must be in [1, 256]\n");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--prompt-file")) {
             c.prompt_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--chat-prompt-file")) {
@@ -271,8 +314,11 @@ static int next_frontier(const bench_config *c, int cur) {
     return next;
 }
 
-static void log_context_memory(ds4_backend backend, int ctx_size) {
+static void log_context_memory(ds4_backend backend, int ctx_size, bool ssd_flash_moe) {
     ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
+    if (ssd_flash_moe && getenv("DS4_METAL_PREFILL_CHUNK") == NULL && m.prefill_cap > 8u) {
+        m.prefill_cap = 8u;
+    }
     fprintf(stderr,
             "ds4-bench: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -285,12 +331,23 @@ static void log_context_memory(ds4_backend backend, int ctx_size) {
 
 int main(int argc, char **argv) {
     bench_config cfg = parse_options(argc, argv);
-    log_context_memory(cfg.backend, cfg.ctx_alloc);
+    char ssd_model_buf[PATH_MAX];
+    char ssd_sidecar_buf[PATH_MAX];
+    resolve_ssd_package(&cfg,
+                        ssd_model_buf,
+                        sizeof(ssd_model_buf),
+                        ssd_sidecar_buf,
+                        sizeof(ssd_sidecar_buf));
+    log_context_memory(cfg.backend,
+                       cfg.ctx_alloc,
+                       cfg.moe_sidecar_path && cfg.moe_sidecar_path[0]);
 
     ds4_engine_options opt = {
         .model_path = cfg.model_path,
+        .moe_sidecar_path = cfg.moe_sidecar_path,
         .backend = cfg.backend,
         .n_threads = cfg.threads,
+        .moe_slot_bank = cfg.moe_slot_bank,
         .warm_weights = cfg.warm_weights,
         .quality = cfg.quality,
     };

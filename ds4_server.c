@@ -7848,8 +7848,39 @@ static const char *need_arg(int *i, int argc, char **argv, const char *opt) {
     return argv[++(*i)];
 }
 
-static void log_context_memory(ds4_backend backend, int ctx_size) {
+static bool path_is_dir(const char *path) {
+    struct stat st;
+    return path && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void resolve_ssd_package(
+        server_config *cfg,
+        char          *model_buf,
+        size_t         model_buf_len,
+        char          *sidecar_buf,
+        size_t         sidecar_buf_len) {
+    if (!path_is_dir(cfg->engine.model_path)) return;
+    int n = snprintf(model_buf, model_buf_len, "%s/dense/model-dense.gguf", cfg->engine.model_path);
+    if (n < 0 || (size_t)n >= model_buf_len) {
+        server_log(DS4_LOG_DEFAULT, "ds4-server: SSD package model path is too long");
+        exit(2);
+    }
+    if (!cfg->engine.moe_sidecar_path || !cfg->engine.moe_sidecar_path[0]) {
+        n = snprintf(sidecar_buf, sidecar_buf_len, "%s/sidecar", cfg->engine.model_path);
+        if (n < 0 || (size_t)n >= sidecar_buf_len) {
+            server_log(DS4_LOG_DEFAULT, "ds4-server: SSD package sidecar path is too long");
+            exit(2);
+        }
+        cfg->engine.moe_sidecar_path = sidecar_buf;
+    }
+    cfg->engine.model_path = model_buf;
+}
+
+static void log_context_memory(ds4_backend backend, int ctx_size, bool ssd_flash_moe) {
     ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
+    if (ssd_flash_moe && getenv("DS4_METAL_PREFILL_CHUNK") == NULL && m.prefill_cap > 8u) {
+        m.prefill_cap = 8u;
+    }
     server_log(DS4_LOG_DEFAULT,
                "ds4-server: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)",
                (double)m.total_bytes / (1024.0 * 1024.0),
@@ -7884,8 +7915,13 @@ static void usage(FILE *fp) {
         "Model and runtime:\n"
         "  -m, --model FILE\n"
         "      GGUF model path. Default: ds4flash.gguf\n"
+        "      SSD package directories are resolved as dense/model-dense.gguf + sidecar/.\n"
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
+        "  --moe-sidecar PATH\n"
+        "      SSD Flash-MoE sidecar directory or manifest.\n"
+        "  --moe-slot-bank N\n"
+        "      SSD resident expert slots per layer. Default: 16\n"
         "  --mtp-draft N\n"
         "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
         "  --mtp-margin F\n"
@@ -7991,6 +8027,7 @@ static server_config parse_options(int argc, char **argv) {
             .backend = default_server_backend(),
             .mtp_draft_tokens = 1,
             .mtp_margin = 3.0f,
+            .moe_slot_bank = 16,
         },
         .host = "127.0.0.1",
         .port = 8000,
@@ -8010,6 +8047,14 @@ static server_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--moe-sidecar")) {
+            c.engine.moe_sidecar_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--moe-slot-bank")) {
+            c.engine.moe_slot_bank = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
+            if (c.engine.moe_slot_bank < 1 || c.engine.moe_slot_bank > 256) {
+                server_log(DS4_LOG_DEFAULT, "ds4-server: --moe-slot-bank must be in [1, 256]");
+                exit(2);
+            }
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int_arg(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
@@ -8096,11 +8141,20 @@ int main(int argc, char **argv) {
     sigaction(SIGTERM, &sa, NULL);
 
     server_config cfg = parse_options(argc, argv);
+    char ssd_model_buf[PATH_MAX];
+    char ssd_sidecar_buf[PATH_MAX];
+    resolve_ssd_package(&cfg,
+                        ssd_model_buf,
+                        sizeof(ssd_model_buf),
+                        ssd_sidecar_buf,
+                        sizeof(ssd_sidecar_buf));
 
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) return 1;
 
-    log_context_memory(cfg.engine.backend, cfg.ctx_size);
+    log_context_memory(cfg.engine.backend,
+                       cfg.ctx_size,
+                       cfg.engine.moe_sidecar_path && cfg.engine.moe_sidecar_path[0]);
 
     ds4_session *session = NULL;
     if (ds4_session_create(&session, engine, cfg.ctx_size) != 0) {

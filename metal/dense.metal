@@ -429,6 +429,169 @@ typedef decltype(kernel_mul_mv_t_t<half, half>) mul_mv_t_t;
 template [[host_name("kernel_mul_mv_f32_f32")]] kernel mul_mv_t_t kernel_mul_mv_t_t<float, float>;
 template [[host_name("kernel_mul_mv_f16_f32")]] kernel mul_mv_t_t kernel_mul_mv_t_t<half,  float>;
 
+template<short NR0, typename args_t>
+void kernel_mul_mv_bf16_f32_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    const short NSG = FC_mul_mv_nsg;
+
+    constexpr short NW = N_SIMDWIDTH;
+    constexpr short NB = 32;
+    constexpr short NF = 8;
+
+    const int nb = args.ne00 / NB;
+    const int r0 = tgpig.x * NR0;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+
+    const uint i12 = im % args.ne12;
+    const uint i13 = im / args.ne12;
+    const uint64_t offset1 = r1 * args.nb11 + i12 * args.nb12 + i13 * args.nb13;
+    device const float * y = (device const float *)(src1 + offset1);
+
+    device const ushort * ax[NR0];
+    FOR_UNROLL (short row = 0; row < NR0; ++row) {
+        const uint64_t offset0 = (r0 + row) * args.nb01 +
+                                 (i12 / args.r2) * args.nb02 +
+                                 (i13 / args.r3) * args.nb03;
+        ax[row] = (device const ushort *)((device const char *)src0 + offset0);
+    }
+
+    float sumf[NR0] = { 0.f };
+    const short ix = tiisg / (NW / NF);
+    const short il = tiisg % (NW / NF);
+    const int ib0 = sgitg * NF + ix;
+
+    float yl[NF];
+    device const float * yb = y + (ib0 * NB + il * NF);
+
+    for (int ib = ib0; ib < nb; ib += NSG * NF) {
+        FOR_UNROLL (short i = 0; i < NF; ++i) {
+            yl[i] = yb[i];
+        }
+
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const ushort * xb = ax[row] + (ib * NB + il * NF);
+
+            float sumq = 0.f;
+            FOR_UNROLL (short i = 0; i < NF; ++i) {
+                sumq += ds4_bf16_to_fp32(xb[i]) * yl[i];
+            }
+            sumf[row] += sumq;
+        }
+
+        yb += NSG * NF * NW;
+    }
+
+    for (int i = nb * NB + sgitg * NW + tiisg; i < args.ne00; i += NW * NSG) {
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            sumf[row] += ds4_bf16_to_fp32(ax[row][i]) * y[i];
+        }
+    }
+
+    device float * dst_f32 = (device float *)dst +
+        (uint64_t)im * args.ne0 * args.ne1 + (uint64_t)r1 * args.ne0;
+
+    helper_mv_reduce_and_write<NR0>(dst_f32, sumf, r0, args.ne01, tiisg, sgitg, shmem);
+}
+
+[[host_name("kernel_mul_mv_bf16_f32")]]
+kernel void kernel_mul_mv_bf16_f32(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_bf16_f32_impl<2, constant ds4_metal_args_mul_mv &>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
+template<int NR0, typename args_t>
+void kernel_mul_mv_f8_e4m3_b128_f32_impl(
+        args_t args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem,
+        uint3  tgpig,
+        ushort tiisg,
+        ushort sgitg) {
+    (void)shmem;
+    const short NSG = FC_mul_mv_nsg;
+    const int nb = args.ne00 / QK_F8_E4M3_B128;
+
+    const int r0 = tgpig.x;
+    const int r1 = tgpig.y;
+    const int im = tgpig.z;
+    const int first_row = (r0 * NSG + sgitg) * NR0;
+
+    const uint i12 = im % args.ne12;
+    const uint i13 = im / args.ne12;
+    const uint64_t offset0 = first_row * args.nb01 +
+                             (i12 / args.r2) * args.nb02 +
+                             (i13 / args.r3) * args.nb03;
+    const uint64_t offset1 = r1 * args.nb11 + i12 * args.nb12 + i13 * args.nb13;
+
+    device const block_f8_e4m3_b128 * x =
+        (device const block_f8_e4m3_b128 *)(src0 + offset0);
+    device const float * y = (device const float *)(src1 + offset1);
+
+    const int ns01 = args.nb01 / args.nb00;
+    const int qoff = int(tiisg) * 4;
+
+    float sumf[NR0] = { 0.f };
+    for (int ib = 0; ib < nb && ib < ns01; ++ib) {
+        device const float4 * y4 = (device const float4 *)(y + ib * QK_F8_E4M3_B128 + qoff);
+        const float4 yl = y4[0];
+
+        FOR_UNROLL (short row = 0; row < NR0; ++row) {
+            device const block_f8_e4m3_b128 & xb = x[row * ns01 + ib];
+            device const uchar * q = xb.qs + qoff;
+            const float d = e8m0_to_fp32(xb.e);
+            const float4 xf = float4(
+                f8_e4m3fn_to_fp32(q[0]),
+                f8_e4m3fn_to_fp32(q[1]),
+                f8_e4m3fn_to_fp32(q[2]),
+                f8_e4m3fn_to_fp32(q[3]));
+            const float4 acc = yl * xf;
+            sumf[row] += d * ((acc[0] + acc[1]) + (acc[2] + acc[3]));
+        }
+    }
+
+    device float * dst_f32 = (device float *)dst +
+        (uint64_t)im * args.ne0 * args.ne1 + (uint64_t)r1 * args.ne0;
+
+    FOR_UNROLL (short row = 0; row < NR0 && first_row + row < args.ne01; ++row) {
+        const float sum_all = simd_sum(sumf[row]);
+        if (tiisg == 0) {
+            dst_f32[first_row + row] = sum_all;
+        }
+    }
+}
+
+[[host_name("kernel_mul_mv_f8_e4m3_b128_f32")]]
+kernel void kernel_mul_mv_f8_e4m3_b128_f32(
+        constant ds4_metal_args_mul_mv & args,
+        device const char * src0,
+        device const char * src1,
+        device       char * dst,
+        threadgroup  char * shmem [[threadgroup(0)]],
+        uint3  tgpig[[threadgroup_position_in_grid]],
+        ushort tiisg[[thread_index_in_simdgroup]],
+        ushort sgitg[[simdgroup_index_in_threadgroup]]) {
+    kernel_mul_mv_f8_e4m3_b128_f32_impl<N_R0_F8_E4M3_B128, constant ds4_metal_args_mul_mv &>(
+        args, src0, src1, dst, shmem, tgpig, tiisg, sgitg);
+}
+
 template<typename T0, typename T04, typename T1, typename T14, short NR0, typename args_t>
 void kernel_mul_mv_t_t_4_impl(
         args_t args,

@@ -1441,6 +1441,18 @@ extern "C" int ds4_gpu_set_model_map_range(const void *model_map, uint64_t model
     return 1;
 }
 
+extern "C" int ds4_gpu_register_external_model_fd(const void *model_map, uint64_t model_size, int fd) {
+    /*
+     * Metal uses this to pread SSD sidecar experts into a resident slot-bank.
+     * CUDA does not yet have an MXFP4 sidecar kernel path, so keep the backend
+     * ABI linkable while the CUDA path continues to use its existing model map.
+     */
+    (void)model_map;
+    (void)model_size;
+    (void)fd;
+    return 1;
+}
+
 extern "C" int ds4_gpu_set_model_fd(int fd) {
     g_model_fd = fd;
     g_model_fd_host_base = g_model_host_base;
@@ -1518,6 +1530,10 @@ extern "C" void ds4_gpu_set_quality(bool quality) {
                 : CUBLAS_TF32_TENSOR_OP_MATH;
         (void)cublasSetMathMode(g_cublas, math_mode);
     }
+}
+
+extern "C" void ds4_gpu_set_mxfp4_slot_bank(uint32_t slots) {
+    (void)slots;
 }
 
 __global__ static void embed_token_hc_kernel(float *out, const unsigned short *w, uint32_t token, uint32_t n_embd, uint32_t n_hc) {

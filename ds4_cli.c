@@ -11,6 +11,7 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <math.h>
 #include <signal.h>
@@ -19,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <stdarg.h>
 #include <time.h>
 #include <unistd.h>
@@ -50,6 +52,9 @@ typedef struct {
     ds4_engine_options engine;
     cli_generation_options gen;
     char *prompt_owned;
+    const char *ssd_llama_bin;
+    int ssd_moe_slot_bank;
+    bool ssd_bridge;
     bool inspect;
 } cli_config;
 
@@ -85,6 +90,16 @@ static void usage(FILE *fp) {
         "      GGUF model path. Default: ds4flash.gguf\n"
         "  --mtp FILE\n"
         "      Optional MTP support GGUF used for draft-token probes.\n"
+        "  --moe-sidecar PATH\n"
+        "      SSD Flash-MoE sidecar directory or manifest. This is loaded by the\n"
+        "      native ds4 graph path.\n"
+        "  --ssd-bridge\n"
+        "      Run the SSD llama.cpp bridge instead of native ds4. Debug fallback only.\n"
+        "  --ssd-llama-bin FILE\n"
+        "      llama-cli binary used by the SSD bridge. Default: DS4_SSD_LLAMA_CLI\n"
+        "      or the local anemll-flash-llama.cpp build path.\n"
+        "  --moe-slot-bank N\n"
+        "      SSD Flash-MoE resident expert slots per layer. Default: 16\n"
         "  --mtp-draft N\n"
         "      Maximum autoregressive MTP draft tokens per speculative step. Default: 1\n"
         "  --mtp-margin F\n"
@@ -240,8 +255,11 @@ static ds4_backend default_backend(void) {
 #endif
 }
 
-static void log_context_memory(ds4_backend backend, int ctx_size) {
+static void log_context_memory(ds4_backend backend, int ctx_size, bool ssd_flash_moe) {
     ds4_context_memory m = ds4_context_memory_estimate(backend, ctx_size);
+    if (ssd_flash_moe && getenv("DS4_METAL_PREFILL_CHUNK") == NULL && m.prefill_cap > 8u) {
+        m.prefill_cap = 8u;
+    }
     fprintf(stderr,
             "ds4: context buffers %.2f MiB (ctx=%d, backend=%s, prefill_chunk=%u, raw_kv_rows=%u, compressed_kv_rows=%u)\n",
             (double)m.total_bytes / (1024.0 * 1024.0),
@@ -307,13 +325,15 @@ static void cli_prefill_progress_cb(void *ud, const char *event, int current, in
                 pct);
         fputs("\x1b[K", stderr);
         if (processed >= p->input_tokens) fputc('\n', stderr);
-    } else {
+    } else if (getenv("DS4_PREFILL_PROGRESS_LOG") != NULL) {
         fprintf(stderr,
                 "processing %d input tokens: %d/%d (%.1f%%)\n",
                 p->input_tokens,
                 processed,
                 p->input_tokens,
                 pct);
+    } else {
+        return;
     }
     fflush(stderr);
 }
@@ -1090,7 +1110,9 @@ static int run_repl(ds4_engine *engine, cli_config *cfg) {
                 fprintf(stderr, "ds4: /ctx needs a positive integer\n");
             } else {
                 cfg->gen.ctx_size = parse_int(arg, "/ctx");
-                log_context_memory(cfg->engine.backend, cfg->gen.ctx_size);
+                log_context_memory(cfg->engine.backend,
+                                   cfg->gen.ctx_size,
+                                   cfg->engine.moe_sidecar_path && cfg->engine.moe_sidecar_path[0]);
                 rc = repl_chat_set_ctx(engine, &chat, cfg->gen.ctx_size);
                 if (rc != 0) {
                     linenoiseFree(line);
@@ -1201,7 +1223,9 @@ static cli_config parse_options(int argc, char **argv) {
             .dump_logprobs_top_k = 20,
             .think_mode = DS4_THINK_HIGH,
         },
+        .ssd_moe_slot_bank = 16,
     };
+    c.engine.moe_slot_bank = c.ssd_moe_slot_bank;
 
     bool directional_steering_scale_set = false;
     for (int i = 1; i < argc; i++) {
@@ -1228,6 +1252,19 @@ static cli_config parse_options(int argc, char **argv) {
             c.engine.model_path = need_arg(&i, argc, argv, arg);
         } else if (!strcmp(arg, "--mtp")) {
             c.engine.mtp_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--moe-sidecar")) {
+            c.engine.moe_sidecar_path = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--ssd-bridge")) {
+            c.ssd_bridge = true;
+        } else if (!strcmp(arg, "--ssd-llama-bin")) {
+            c.ssd_llama_bin = need_arg(&i, argc, argv, arg);
+        } else if (!strcmp(arg, "--moe-slot-bank")) {
+            c.ssd_moe_slot_bank = parse_int(need_arg(&i, argc, argv, arg), arg);
+            if (c.ssd_moe_slot_bank < 1 || c.ssd_moe_slot_bank > 256) {
+                fprintf(stderr, "ds4: --moe-slot-bank must be in [1, 256]\n");
+                exit(2);
+            }
+            c.engine.moe_slot_bank = c.ssd_moe_slot_bank;
         } else if (!strcmp(arg, "--mtp-draft")) {
             c.engine.mtp_draft_tokens = parse_int(need_arg(&i, argc, argv, arg), arg);
         } else if (!strcmp(arg, "--mtp-margin")) {
@@ -1301,6 +1338,7 @@ static cli_config parse_options(int argc, char **argv) {
             exit(2);
         } else if (!strcmp(arg, "--inspect")) {
             c.inspect = true;
+            c.engine.inspect_only = true;
         } else if (!strcmp(arg, "--warm-weights")) {
             c.engine.warm_weights = true;
         } else if (!strcmp(arg, "--server")) {
@@ -1328,8 +1366,162 @@ static cli_config parse_options(int argc, char **argv) {
     return c;
 }
 
+static const char *ssd_default_llama_bin(void) {
+    const char *env = getenv("DS4_SSD_LLAMA_CLI");
+    if (env && env[0]) return env;
+    return "/Users/eouya/llm/PROJECT/deepseek-v4-SSD/anemll-flash-llama.cpp/build/bin/llama-cli";
+}
+
+static bool path_is_dir(const char *path) {
+    struct stat st;
+    return path && stat(path, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static void ssd_resolve_model_and_sidecar(
+        const cli_config *cfg,
+        char             *model_buf,
+        size_t            model_buf_len,
+        char             *sidecar_buf,
+        size_t            sidecar_buf_len,
+        const char      **model_path,
+        const char      **sidecar_path) {
+    *model_path = cfg->engine.model_path;
+    *sidecar_path = cfg->engine.moe_sidecar_path;
+
+    if (path_is_dir(cfg->engine.model_path)) {
+        int n = snprintf(model_buf, model_buf_len, "%s/dense/model-dense.gguf", cfg->engine.model_path);
+        if (n < 0 || (size_t)n >= model_buf_len) {
+            fprintf(stderr, "ds4: SSD package model path is too long\n");
+            exit(2);
+        }
+        *model_path = model_buf;
+        if (!*sidecar_path || !(*sidecar_path)[0]) {
+            n = snprintf(sidecar_buf, sidecar_buf_len, "%s/sidecar", cfg->engine.model_path);
+            if (n < 0 || (size_t)n >= sidecar_buf_len) {
+                fprintf(stderr, "ds4: SSD package sidecar path is too long\n");
+                exit(2);
+            }
+            *sidecar_path = sidecar_buf;
+        }
+    }
+}
+
+static void ssd_bridge_add(char **argv, size_t cap, size_t *n, const char *arg) {
+    if (*n + 1 >= cap) {
+        fprintf(stderr, "ds4: internal error: SSD bridge argv overflow\n");
+        exit(2);
+    }
+    argv[(*n)++] = (char *)arg;
+}
+
+static int run_ssd_llama_bridge(const cli_config *cfg) {
+    if (getenv("DS4_SSD_NATIVE")) return -1;
+
+    char model_buf[PATH_MAX];
+    char sidecar_buf[PATH_MAX];
+    const char *model_path = NULL;
+    const char *sidecar_path = NULL;
+    ssd_resolve_model_and_sidecar(cfg,
+                                  model_buf,
+                                  sizeof(model_buf),
+                                  sidecar_buf,
+                                  sizeof(sidecar_buf),
+                                  &model_path,
+                                  &sidecar_path);
+    if (!sidecar_path || !sidecar_path[0]) return -1;
+
+    const char *llama_bin = cfg->ssd_llama_bin && cfg->ssd_llama_bin[0] ?
+        cfg->ssd_llama_bin : ssd_default_llama_bin();
+    if (access(llama_bin, X_OK) != 0) {
+        fprintf(stderr,
+                "ds4: SSD bridge needs an executable llama-cli. Tried: %s\n"
+                "ds4: set DS4_SSD_LLAMA_CLI or pass --ssd-llama-bin FILE\n",
+                llama_bin);
+        return 1;
+    }
+
+    char ctx_buf[32];
+    char n_buf[32];
+    char temp_buf[64];
+    char top_p_buf[64];
+    char seed_buf[32];
+    char slot_buf[32];
+    snprintf(ctx_buf, sizeof(ctx_buf), "%d", cfg->gen.ctx_size);
+    snprintf(n_buf, sizeof(n_buf), "%d", cfg->gen.n_predict);
+    snprintf(temp_buf, sizeof(temp_buf), "%.9g", (double)cfg->gen.temperature);
+    snprintf(top_p_buf, sizeof(top_p_buf), "%.9g", (double)cfg->gen.top_p);
+    snprintf(seed_buf, sizeof(seed_buf), "%" PRIu64, cfg->gen.seed);
+    snprintf(slot_buf, sizeof(slot_buf), "%d", cfg->ssd_moe_slot_bank);
+
+    char *args[80];
+    size_t n = 0;
+    ssd_bridge_add(args, 80, &n, llama_bin);
+    ssd_bridge_add(args, 80, &n, "-m");
+    ssd_bridge_add(args, 80, &n, model_path);
+    ssd_bridge_add(args, 80, &n, "--moe-sidecar");
+    ssd_bridge_add(args, 80, &n, sidecar_path);
+    ssd_bridge_add(args, 80, &n, "--moe-mode");
+    ssd_bridge_add(args, 80, &n, "slot-bank");
+    ssd_bridge_add(args, 80, &n, "--moe-slot-bank");
+    ssd_bridge_add(args, 80, &n, slot_buf);
+    ssd_bridge_add(args, 80, &n, "--ctx-size");
+    ssd_bridge_add(args, 80, &n, ctx_buf);
+    ssd_bridge_add(args, 80, &n, "--n-predict");
+    ssd_bridge_add(args, 80, &n, n_buf);
+    ssd_bridge_add(args, 80, &n, "--temp");
+    ssd_bridge_add(args, 80, &n, temp_buf);
+    ssd_bridge_add(args, 80, &n, "--top-p");
+    ssd_bridge_add(args, 80, &n, top_p_buf);
+    if (cfg->gen.seed != 0) {
+        ssd_bridge_add(args, 80, &n, "--seed");
+        ssd_bridge_add(args, 80, &n, seed_buf);
+    }
+    if (cfg->gen.think_mode == DS4_THINK_NONE) {
+        ssd_bridge_add(args, 80, &n, "--reasoning");
+        ssd_bridge_add(args, 80, &n, "off");
+    }
+    ssd_bridge_add(args, 80, &n, "--no-warmup");
+    ssd_bridge_add(args, 80, &n, "--simple-io");
+
+    if (cfg->gen.prompt) {
+        ssd_bridge_add(args, 80, &n, "--no-display-prompt");
+        ssd_bridge_add(args, 80, &n, "--moe-trace-harness");
+        ssd_bridge_add(args, 80, &n, "-p");
+        ssd_bridge_add(args, 80, &n, cfg->gen.prompt);
+    }
+    args[n] = NULL;
+
+    fprintf(stderr,
+            "ds4: SSD bridge -> %s (model=%s, sidecar=%s, slot_bank=%d)\n",
+            llama_bin,
+            model_path,
+            sidecar_path,
+            cfg->ssd_moe_slot_bank);
+    execv(llama_bin, args);
+    fprintf(stderr, "ds4: failed to exec SSD bridge binary: %s\n", llama_bin);
+    return 1;
+}
+
 int main(int argc, char **argv) {
     cli_config cfg = parse_options(argc, argv);
+    char ssd_model_buf[PATH_MAX];
+    char ssd_sidecar_buf[PATH_MAX];
+    bool ssd_flash_moe = false;
+    if ((cfg.engine.moe_sidecar_path && cfg.engine.moe_sidecar_path[0]) ||
+        path_is_dir(cfg.engine.model_path)) {
+        const char *model_path = cfg.engine.model_path;
+        const char *sidecar_path = cfg.engine.moe_sidecar_path;
+        ssd_resolve_model_and_sidecar(&cfg,
+                                      ssd_model_buf,
+                                      sizeof(ssd_model_buf),
+                                      ssd_sidecar_buf,
+                                      sizeof(ssd_sidecar_buf),
+                                      &model_path,
+                                      &sidecar_path);
+        cfg.engine.model_path = model_path;
+        cfg.engine.moe_sidecar_path = sidecar_path;
+        ssd_flash_moe = sidecar_path && sidecar_path[0];
+    }
     if (cfg.gen.dump_tokens) {
         if (cfg.gen.prompt == NULL) {
             fprintf(stderr, "ds4: --dump-tokens requires -p or --prompt-file\n");
@@ -1343,8 +1535,15 @@ int main(int argc, char **argv) {
         return rc;
     }
     if (!cfg.inspect) {
-        log_context_memory(cfg.engine.backend, cfg.gen.ctx_size);
+        log_context_memory(cfg.engine.backend, cfg.gen.ctx_size, ssd_flash_moe);
         cli_warn_think_max_downgraded(&cfg.gen, "--think-max");
+    }
+    if (cfg.ssd_bridge && !cfg.inspect) {
+        int bridge_rc = run_ssd_llama_bridge(&cfg);
+        if (bridge_rc >= 0) {
+            free(cfg.prompt_owned);
+            return bridge_rc;
+        }
     }
     ds4_engine *engine = NULL;
     if (ds4_engine_open(&engine, &cfg.engine) != 0) {

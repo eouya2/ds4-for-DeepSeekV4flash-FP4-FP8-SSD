@@ -58,15 +58,18 @@ typedef void (*ds4_session_progress_fn)(void *ud, const char *event, int current
 typedef struct {
     const char *model_path;
     const char *mtp_path;
+    const char *moe_sidecar_path;
     ds4_backend backend;
     int n_threads;
     int mtp_draft_tokens;
     float mtp_margin;
+    int moe_slot_bank;
     const char *directional_steering_file;
     float directional_steering_attn;
     float directional_steering_ffn;
     bool warm_weights;
     bool quality;
+    bool inspect_only;
 } ds4_engine_options;
 
 typedef void (*ds4_token_emit_fn)(void *ud, int token);
