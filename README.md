@@ -29,9 +29,10 @@ DeepSeek-V4-Flash-FP4-FP8-SSD/
 ```
 
 The dense GGUF stores dense/shared tensors mostly as `F8_E4M3_B128` FP8. The
-routed MoE experts are stored outside the dense GGUF as `MXFP4` sidecar tensors.
-This fork keeps that layout and runs it directly; it does not rewrite, prune, or
-re-quantize the model.
+published routed MoE experts are stored outside the dense GGUF as `MXFP4`
+sidecar tensors. This fork keeps that layout and runs it directly. It also has
+experimental support for package views that keep the same dense GGUF while using
+a `Q3_K` sidecar built from the routed expert tensors.
 
 ## Download the Model
 
@@ -106,7 +107,7 @@ Expected summary:
 ```text
 experts: count=256 used=6
 ssd sidecar: .../sidecar/manifest.json
-entries: total=129 mxfp4=129
+entries: total=129 mxfp4=129 q3_k=0
 coverage: layers_with_gate_up_down=43/43
 tensor types include: bf16, f32, i32, f8_e4m3_b128
 ```
@@ -182,11 +183,14 @@ You can also pass an explicit sidecar path:
 The dense GGUF uses `F8_E4M3_B128` tensors. This fork adds native Metal matmul
 and attention-output paths for that tensor type.
 
-### MXFP4 sidecar MoE support
+### MXFP4 and Q3_K sidecar MoE support
 
-The routed experts live in sidecar layer banks as `MXFP4`. The engine parses the
-sidecar manifest, binds the routed `ffn_gate_exps`, `ffn_up_exps`, and
-`ffn_down_exps` tensors, and routes MoE execution through native Metal kernels.
+The published routed experts live in sidecar layer banks as `MXFP4`. The engine
+parses the sidecar manifest, binds the routed `ffn_gate_exps`, `ffn_up_exps`,
+and `ffn_down_exps` tensors, and routes MoE execution through native Metal
+kernels. Experimental `Q3_K` sidecars are accepted when all three routed expert
+families use `Q3_K`; mixed sidecar quantization layouts fail during manifest
+loading with a clear error.
 
 ### Slot-bank execution
 
@@ -207,9 +211,35 @@ Useful knobs:
 ```bash
 --moe-slot-bank N                     # default 16 for SSD sidecar mode
 DS4_METAL_DISABLE_MXFP4_SLOT_BANK=1   # debug: disable slot-bank path
+DS4_METAL_DISABLE_SSD_SLOT_BANK=1     # debug: same as above, format-neutral
 DS4_METAL_MXFP4_SERIAL_PREAD=1        # debug: force serial sidecar pread
 DS4_METAL_MXFP4_PREAD_WORKERS=N       # default 4, capped at 16
 DS4_METAL_MXFP4_SLOT_PROFILE=1        # print slot-bank install stats
+```
+
+### Experimental Q3_K package view
+
+For experiments, keep the original dense GGUF and point the sidecar directory at
+a rebuilt `Q3_K` sidecar:
+
+```bash
+mkdir -p /path/to/DeepSeek-V4-Flash-FP4-FP8-SSD-q3k
+ln -s /path/to/DeepSeek-V4-Flash-FP4-FP8-SSD/dense \
+  /path/to/DeepSeek-V4-Flash-FP4-FP8-SSD-q3k/dense
+ln -s /path/to/sidecar-q3k \
+  /path/to/DeepSeek-V4-Flash-FP4-FP8-SSD-q3k/sidecar
+
+./ds4 --inspect -m /path/to/DeepSeek-V4-Flash-FP4-FP8-SSD-q3k
+./ds4 \
+  -m /path/to/DeepSeek-V4-Flash-FP4-FP8-SSD-q3k \
+  --ctx 512 --nothink --temp 0 -n 32 \
+  -p "한국의 수도는?"
+```
+
+Expected inspect summary for this package view includes:
+
+```text
+entries: total=129 mxfp4=0 q3_k=129
 ```
 
 ### Existing ds4 features kept
@@ -261,17 +291,19 @@ prefill 11.86 t/s, generation 6.75 t/s
 ## Limitations
 
 - The fast SSD path is currently validated on Apple Metal.
-- CUDA/NVIDIA support for this SSD MXFP4 sidecar path is not complete; CUDA stubs
-  exist to keep the build/API surface intact.
+- CUDA/NVIDIA support for the SSD sidecar path is not complete; CUDA stubs exist
+  to keep the build/API surface intact.
 - AMD is not supported by this fork.
 - MTP options are preserved, but real MTP execution still needs a local MTP GGUF
   smoke test.
 - This is not a generic GGUF runner. It is specialized for DeepSeek V4 Flash and
   this Flash-MoE SSD package layout.
-- The model is mixed quantization, not "all 4-bit":
+- The published model is mixed quantization, not "all 4-bit":
   - dense/shared tensors: FP8 `F8_E4M3_B128`
   - routed MoE experts: FP4/MXFP4 sidecar
   - some metadata/norm/router tensors: BF16/F32/I32
+- The `Q3_K` sidecar path is experimental and intended for local quality and
+  residency experiments, not as a replacement for the published package.
 - No model quality benchmark was performed here. The validation is loading,
   execution, kernel smoke, long-context smoke, and speed comparison.
 

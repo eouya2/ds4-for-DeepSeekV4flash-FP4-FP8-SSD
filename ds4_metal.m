@@ -30,6 +30,7 @@
 
 enum {
     DS4_METAL_TENSOR_Q2_K    = 10,
+    DS4_METAL_TENSOR_Q3_K    = 11,
     DS4_METAL_TENSOR_Q4_K    = 12,
     DS4_METAL_TENSOR_IQ2_XXS = 16,
     DS4_METAL_TENSOR_MXFP4   = 39,
@@ -76,6 +77,7 @@ static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_iq2_xxs_pair_swiglu_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q2_k_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q2_k_sum6_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mv_id_q3_k_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pair_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_pair_swiglu_pipeline;
@@ -83,6 +85,7 @@ static id<MTLComputePipelineState> g_moe_mul_mv_id_q4_k_sum6_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mv_id_mxfp4_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mm_id_iq2_xxs_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mm_id_q2_k_pipeline;
+static id<MTLComputePipelineState> g_moe_mul_mm_id_q3_k_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mm_id_q4_k_pipeline;
 static id<MTLComputePipelineState> g_moe_mul_mm_id_mxfp4_pipeline;
 static id<MTLComputePipelineState> g_rope_tail_batch_pipeline;
@@ -1221,6 +1224,10 @@ void ds4_gpu_set_mxfp4_slot_bank(uint32_t slots) {
     if (slots == 0) slots = 1;
     if (slots > 256u) slots = 256u;
     g_mxfp4_slot_bank_min_capacity = slots;
+}
+
+static bool ds4_gpu_sidecar_slot_bank_type(uint32_t type) {
+    return type == DS4_METAL_TENSOR_MXFP4 || type == DS4_METAL_TENSOR_Q3_K;
 }
 
 static id<MTLBuffer> ds4_gpu_wrap_model_range(
@@ -3368,6 +3375,26 @@ int ds4_gpu_init(void) {
         g_moe_mul_mv_id_q2_k_sum6_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
         if (!g_moe_mul_mv_id_q2_k_sum6_pipeline) {
             fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q2_K_sum6_f32 pipeline failed: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+
+        error = nil;
+        fn = [library newFunctionWithName:@"kernel_mul_mv_id_q3_K_f32"
+                           constantValues:moe_mv_id_constants
+                                    error:&error];
+        if (!fn) {
+            fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q3_K_f32 function not found: %s\n",
+                    [[error localizedDescription] UTF8String]);
+            g_queue = nil;
+            g_device = nil;
+            return 0;
+        }
+        g_moe_mul_mv_id_q3_k_pipeline = [g_device newComputePipelineStateWithFunction:fn error:&error];
+        if (!g_moe_mul_mv_id_q3_k_pipeline) {
+            fprintf(stderr, "ds4: Metal kernel_mul_mv_id_q3_K_f32 pipeline failed: %s\n",
                     [[error localizedDescription] UTF8String]);
             g_queue = nil;
             g_device = nil;
@@ -12137,6 +12164,7 @@ static ds4_gpu_mul_mm_id_args ds4_gpu_make_mul_mm_id_args_src1_size(
 
 static uint32_t ds4_gpu_routed_mv_nr0(uint32_t type) {
     switch (type) {
+    case DS4_METAL_TENSOR_Q3_K:
     case DS4_METAL_TENSOR_Q4_K:    return 2;
     case DS4_METAL_TENSOR_MXFP4:   return 2;
     case DS4_METAL_TENSOR_Q2_K:
@@ -12159,6 +12187,7 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mv_pipeline(uint32_t type) {
     switch (type) {
     case DS4_METAL_TENSOR_IQ2_XXS: return g_moe_mul_mv_id_iq2_xxs_pipeline;
     case DS4_METAL_TENSOR_Q2_K:    return g_moe_mul_mv_id_q2_k_pipeline;
+    case DS4_METAL_TENSOR_Q3_K:    return g_moe_mul_mv_id_q3_k_pipeline;
     case DS4_METAL_TENSOR_Q4_K:    return g_moe_mul_mv_id_q4_k_pipeline;
     case DS4_METAL_TENSOR_MXFP4:   return g_moe_mul_mv_id_mxfp4_pipeline;
     default:                       return nil;
@@ -12179,6 +12208,12 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_pipeline(uint32_t type) {
                 ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f32", false);
         }
         return g_moe_mul_mm_id_q2_k_pipeline;
+    case DS4_METAL_TENSOR_Q3_K:
+        if (!g_moe_mul_mm_id_q3_k_pipeline) {
+            g_moe_mul_mm_id_q3_k_pipeline =
+                ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q3_K_f32", false);
+        }
+        return g_moe_mul_mm_id_q3_k_pipeline;
     case DS4_METAL_TENSOR_Q4_K:
         if (!g_moe_mul_mm_id_q4_k_pipeline) {
             g_moe_mul_mm_id_q4_k_pipeline =
@@ -12202,6 +12237,8 @@ static id<MTLComputePipelineState> ds4_gpu_routed_mm_f16_rhs_pipeline(uint32_t t
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_iq2_xxs_f16", false);
     case DS4_METAL_TENSOR_Q2_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q2_K_f16", false);
+    case DS4_METAL_TENSOR_Q3_K:
+        return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q3_K_f16", false);
     case DS4_METAL_TENSOR_Q4_K:
         return ds4_gpu_get_mul_mm_id_pipeline("kernel_mul_mm_id_q4_K_f16", false);
     case DS4_METAL_TENSOR_MXFP4:
@@ -13349,12 +13386,12 @@ int ds4_gpu_routed_moe_one_tensor(
     if ((expert_in_dim % 256u) != 0 || (expert_mid_dim % 256u) != 0) return 0;
 
     /*
-     * SSD Flash-MoE stores routed experts outside the dense GGUF as MXFP4
-     * sidecar files. Decode is one token at a time, but it must still use the
+     * SSD Flash-MoE stores routed experts outside the dense GGUF as sidecar
+     * files. Decode is one token at a time, but it must still use the
      * same resident slot-bank path as prefill; otherwise Metal would wrap the
      * full sidecar tensor and fault random expert pages directly from the GPU.
      */
-    if (gate_type == DS4_METAL_TENSOR_MXFP4 && down_type == DS4_METAL_TENSOR_MXFP4) {
+    if (gate_type == down_type && ds4_gpu_sidecar_slot_bank_type(gate_type)) {
         return ds4_gpu_routed_moe_batch_tensor(out,
                                                gate,
                                                up,
@@ -13977,19 +14014,20 @@ int ds4_gpu_routed_moe_batch_tensor(
         id<MTLBuffer> gate_buf = nil;
         id<MTLBuffer> up_buf = nil;
         id<MTLBuffer> down_buf = nil;
-        const bool use_mxfp4_slot_bank =
-            gate_type == DS4_METAL_TENSOR_MXFP4 &&
-            down_type == DS4_METAL_TENSOR_MXFP4 &&
+        const bool use_sidecar_slot_bank =
+            gate_type == down_type &&
+            ds4_gpu_sidecar_slot_bank_type(gate_type) &&
             g_batch_cb != nil &&
-            getenv("DS4_METAL_DISABLE_MXFP4_SLOT_BANK") == NULL;
-        if (use_mxfp4_slot_bank) {
+            getenv("DS4_METAL_DISABLE_MXFP4_SLOT_BANK") == NULL &&
+            getenv("DS4_METAL_DISABLE_SSD_SLOT_BANK") == NULL;
+        if (use_sidecar_slot_bank) {
             const bool slot_profile = getenv("DS4_METAL_MXFP4_SLOT_PROFILE") != NULL;
             const double slot_t0 = slot_profile ? ds4_gpu_now_ms() : 0.0;
             if (gate_offset > model_size || up_offset > model_size || down_offset > model_size ||
                 full_gate_tensor_bytes > model_size - gate_offset ||
                 full_gate_tensor_bytes > model_size - up_offset ||
                 full_down_tensor_bytes > model_size - down_offset) {
-                fprintf(stderr, "ds4: Metal MXFP4 slot-bank source range is outside the mapped model\n");
+                fprintf(stderr, "ds4: Metal SSD slot-bank source range is outside the mapped model\n");
                 return 0;
             }
 
@@ -14137,7 +14175,7 @@ int ds4_gpu_routed_moe_batch_tensor(
                     for (uint32_t i = 0; i < install_task_count; i++) {
                         if (!install_tasks[i].ok) {
                             fprintf(stderr,
-                                    "ds4: failed to read MXFP4 sidecar expert %d into slot %d\n",
+                                    "ds4: failed to read SSD sidecar expert %d into slot %d\n",
                                     install_tasks[i].expert,
                                     install_tasks[i].slot);
                             break;
@@ -14181,7 +14219,8 @@ int ds4_gpu_routed_moe_batch_tensor(
             if (slot_profile) {
                 const double slot_ms = ds4_gpu_now_ms() - slot_t0;
                 fprintf(stderr,
-                        "ds4: MXFP4 slot-bank tokens=%u needed=%u capacity=%u hits=%u misses=%u install=%.3f ms\n",
+                        "ds4: SSD slot-bank type=%u tokens=%u needed=%u capacity=%u hits=%u misses=%u install=%.3f ms\n",
+                        gate_type,
                         n_tokens,
                         needed_count,
                         bank->capacity,

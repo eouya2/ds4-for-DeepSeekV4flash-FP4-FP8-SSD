@@ -123,6 +123,7 @@ static int g_ds4_lock_fd = -1;
  * These layouts and IQ2 tables match the GGUF quantized tensor format,
  * reduced to only the formats ds4.c currently reads:
  *   - Q2_K routed down experts
+ *   - Q3_K SSD sidecar routed experts
  *   - Q4_K routed experts in the high-memory variant
  *   - IQ2_XXS routed gate/up experts
  *   - Q8_K temporary activation blocks for dot products
@@ -137,6 +138,13 @@ typedef struct {
     uint16_t d;
     uint16_t dmin;
 } block_q2_K;
+
+typedef struct {
+    uint8_t  hmask[QK_K / 8];
+    uint8_t  qs[QK_K / 4];
+    uint8_t  scales[12];
+    uint16_t d;
+} block_q3_K;
 
 typedef struct {
     uint16_t d;
@@ -168,6 +176,7 @@ typedef struct {
 
 #define DS4_STATIC_ASSERT(name, cond) typedef char name[(cond) ? 1 : -1]
 DS4_STATIC_ASSERT(ds4_block_q2_k_size, sizeof(block_q2_K) == 84);
+DS4_STATIC_ASSERT(ds4_block_q3_k_size, sizeof(block_q3_K) == 110);
 DS4_STATIC_ASSERT(ds4_block_q4_k_size, sizeof(block_q4_K) == 144);
 DS4_STATIC_ASSERT(ds4_block_q8_k_size, sizeof(block_q8_K) == 292);
 DS4_STATIC_ASSERT(ds4_block_iq2_xxs_size, sizeof(block_iq2_xxs) == 66);
@@ -907,6 +916,7 @@ enum {
     DS4_TENSOR_F16      = 1,
     DS4_TENSOR_Q8_0     = 8,
     DS4_TENSOR_Q2_K     = 10,
+    DS4_TENSOR_Q3_K     = 11,
     DS4_TENSOR_Q4_K     = 12,
     DS4_TENSOR_IQ2_XXS  = 16,
     DS4_TENSOR_I32      = 26,
@@ -960,8 +970,10 @@ typedef struct {
     uint32_t expert_used_count;
     uint64_t entries;
     uint64_t mxfp4_entries;
+    uint64_t q3_k_entries;
     uint64_t total_entry_bytes;
     uint64_t bytes_per_expert;
+    uint32_t routed_tensor_type;
     uint64_t missing_files;
     uint64_t too_small_files;
     uint32_t layer_entries[DS4_N_LAYER];
@@ -1254,6 +1266,15 @@ static int ds4_sidecar_family_index(const char *family) {
     return -1;
 }
 
+static uint32_t ds4_sidecar_quant_tensor_type(const char *quant) {
+    if (!quant || !quant[0]) return UINT32_MAX;
+    if (!strcmp(quant, "MXFP4")) return DS4_TENSOR_MXFP4;
+    if (!strcmp(quant, "Q3_K") || !strcmp(quant, "q3_K") || !strcmp(quant, "q3_k")) {
+        return DS4_TENSOR_Q3_K;
+    }
+    return UINT32_MAX;
+}
+
 static bool ds4_ssd_sidecar_resolve(ds4_ssd_sidecar *s, const char *path) {
     struct stat st;
     if (stat(path, &st) == -1) {
@@ -1331,6 +1352,7 @@ static void ds4_ssd_sidecar_bind_tensor(
         uint32_t         layer,
         int              family_idx,
         const char      *family,
+        uint32_t         tensor_type,
         uint64_t         offset,
         uint64_t         exact) {
     if (layer >= DS4_N_LAYER || family_idx < 0 || family_idx >= 3) return;
@@ -1347,7 +1369,7 @@ static void ds4_ssd_sidecar_bind_tensor(
     t->dim[0] = d0;
     t->dim[1] = d1;
     t->dim[2] = DS4_N_EXPERT;
-    t->type = DS4_TENSOR_MXFP4;
+    t->type = tensor_type;
     t->rel_offset = offset;
     t->abs_offset = offset;
     t->elements = d0 * d1 * (uint64_t)DS4_N_EXPERT;
@@ -1417,21 +1439,45 @@ static bool ds4_ssd_sidecar_load(ds4_ssd_sidecar *s, const char *path) {
         (void)json_u64_between(entry_start, entry_end, "bytes_per_expert", &bpe);
         (void)json_u64_between(entry_start, entry_end, "repacked_offset", &repacked_offset);
 
+        int family_idx = ds4_sidecar_family_index(family);
+        uint32_t tensor_type = ds4_sidecar_quant_tensor_type(quant);
+        if (family_idx >= 0 && tensor_type == UINT32_MAX) {
+            fprintf(stderr,
+                    "ds4: unsupported SSD sidecar quant_type '%s' for %s layer %u\n",
+                    quant[0] ? quant : "(missing)",
+                    family,
+                    layer);
+            free(text);
+            return false;
+        }
+        if (family_idx >= 0) {
+            if (s->routed_tensor_type == 0) {
+                s->routed_tensor_type = tensor_type;
+            } else if (s->routed_tensor_type != tensor_type) {
+                fprintf(stderr,
+                        "ds4: mixed SSD sidecar routed quant types are not supported (%s and %s)\n",
+                        tensor_type_name(s->routed_tensor_type),
+                        tensor_type_name(tensor_type));
+                free(text);
+                return false;
+            }
+        }
+
         s->entries++;
         s->total_entry_bytes += exact;
         if (!strcmp(quant, "MXFP4")) s->mxfp4_entries++;
+        if (tensor_type == DS4_TENSOR_Q3_K) s->q3_k_entries++;
         if (bpe != 0 && s->bytes_per_expert == 0) s->bytes_per_expert = bpe;
         if (layer < DS4_N_LAYER) {
             s->layer_entries[layer]++;
-            int family_idx = ds4_sidecar_family_index(family);
             if (family_idx >= 0) s->layer_family_seen[layer][family_idx] = 1;
         }
         if (file[0]) {
             (void)ds4_ssd_sidecar_check_file(s, file, repacked_offset, exact);
-            int family_idx = layer < DS4_N_LAYER ? ds4_sidecar_family_index(family) : -1;
+            if (layer >= DS4_N_LAYER) family_idx = -1;
             if (family_idx >= 0 &&
                 ds4_ssd_sidecar_map_layer_file(s, layer, file)) {
-                ds4_ssd_sidecar_bind_tensor(s, layer, family_idx, family, repacked_offset, exact);
+                ds4_ssd_sidecar_bind_tensor(s, layer, family_idx, family, tensor_type, repacked_offset, exact);
             }
         }
         p = next ? next : end;
@@ -1657,9 +1703,10 @@ static void ssd_sidecar_summary(const ds4_ssd_sidecar *s) {
            s->expert_count,
            s->expert_used_count,
            s->bytes_per_expert);
-    printf("  entries: total=%" PRIu64 " mxfp4=%" PRIu64 " described_bytes=",
+    printf("  entries: total=%" PRIu64 " mxfp4=%" PRIu64 " q3_k=%" PRIu64 " described_bytes=",
            s->entries,
-           s->mxfp4_entries);
+           s->mxfp4_entries,
+           s->q3_k_entries);
     print_size(s->total_entry_bytes);
     printf("\n");
     printf("  coverage: layers_with_gate_up_down=%u/%u missing_families=%u\n",
@@ -2729,6 +2776,7 @@ static void tensor_expect_plain_layout(
 static bool tensor_is_routed_expert_type(uint32_t type) {
     return type == DS4_TENSOR_IQ2_XXS ||
            type == DS4_TENSOR_Q2_K ||
+           type == DS4_TENSOR_Q3_K ||
            type == DS4_TENSOR_Q4_K ||
            type == DS4_TENSOR_MXFP4;
 }
@@ -2737,6 +2785,7 @@ static DS4_MAYBE_UNUSED uint64_t routed_expert_block_bytes(uint32_t type) {
     switch (type) {
     case DS4_TENSOR_IQ2_XXS: return sizeof(block_iq2_xxs);
     case DS4_TENSOR_Q2_K:    return sizeof(block_q2_K);
+    case DS4_TENSOR_Q3_K:    return sizeof(block_q3_K);
     case DS4_TENSOR_Q4_K:    return sizeof(block_q4_K);
     case DS4_TENSOR_MXFP4:   return sizeof(block_mxfp4);
     default:                 ds4_die("unsupported routed expert tensor type");
@@ -3180,13 +3229,16 @@ static void weights_bind(ds4_weights *w, const ds4_model *m, ds4_ssd_sidecar *si
 }
 
 static DS4_MAYBE_UNUSED bool weights_use_ssd_flash_moe(const ds4_weights *w) {
-    return w &&
-           w->layer[0].ffn_gate_exps &&
-           w->layer[0].ffn_up_exps &&
-           w->layer[0].ffn_down_exps &&
-           w->layer[0].ffn_gate_exps->type == DS4_TENSOR_MXFP4 &&
-           w->layer[0].ffn_up_exps->type == DS4_TENSOR_MXFP4 &&
-           w->layer[0].ffn_down_exps->type == DS4_TENSOR_MXFP4;
+    if (!w ||
+        !w->layer[0].ffn_gate_exps ||
+        !w->layer[0].ffn_up_exps ||
+        !w->layer[0].ffn_down_exps) {
+        return false;
+    }
+    const uint32_t type = w->layer[0].ffn_gate_exps->type;
+    return (type == DS4_TENSOR_MXFP4 || type == DS4_TENSOR_Q3_K) &&
+           w->layer[0].ffn_up_exps->type == type &&
+           w->layer[0].ffn_down_exps->type == type;
 }
 
 static void mtp_weights_bind(ds4_mtp_weights *w, const ds4_model *m) {
@@ -17842,7 +17894,8 @@ int ds4_engine_open(ds4_engine **out, const ds4_engine_options *opt) {
     if (e->ssd_sidecar.loaded) {
         fprintf(stderr,
                 "ds4: SSD Flash-MoE sidecar enabled: F8_E4M3_B128 dense tensors "
-                "and MXFP4 routed experts will run through the native graph path\n");
+                "and %s routed experts will run through the native graph path\n",
+                tensor_type_name(e->ssd_sidecar.routed_tensor_type));
     }
     if (opt->warm_weights) model_warm_weights(&e->model);
     vocab_load(&e->vocab, &e->model);
