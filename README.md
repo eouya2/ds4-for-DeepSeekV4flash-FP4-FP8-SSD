@@ -275,8 +275,3 @@ prefill 11.86 t/s, generation 6.75 t/s
 - No model quality benchmark was performed here. The validation is loading,
   execution, kernel smoke, long-context smoke, and speed comparison.
 
-## Notes for GitHub
-
-Do not commit the model package or generated GGUF/sidecar files to this repo.
-Keep this repository as the runtime source tree and download the model with
-`hf download` as shown above.
