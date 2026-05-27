@@ -146,7 +146,8 @@ python3 speed-bench/compare_ssd_runtime.py \
   --reference-bin /path/to/anemll-flash-llama.cpp/build/bin/llama-cli
 ```
 
-Local development result on Apple Metal with `ctx=512`, `n=64`:
+Local development result on an Apple M5 Max with 128 GB unified memory
+(`ctx=512`, `n=64`):
 
 ```text
 case   ds4 prefill   ref prefill   ds4 gen   ref gen   total ratio
@@ -248,7 +249,7 @@ python3 speed-bench/compare_ssd_runtime.py \
   --min-total-ratio 1.0
 ```
 
-Longer smoke:
+Longer smoke on the same Apple M5 Max 128 GB machine:
 
 ```text
 8192 prompt tokens:
